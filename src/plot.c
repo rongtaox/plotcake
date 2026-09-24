@@ -11,9 +11,14 @@
 #include "file.h"
 #include "plot.h"
 #include "keyboard.h"
+#include "utils.h"
 
 chtype colors[C_MAX] = { 0 };
 static const char *verstring = GIT_REPO " " MY_VERSION;
+
+static void __paint_help_win(struct plot *p, bool init);
+static void __del_help_win(struct plot *p);
+static void __paint_llabels(const struct plot *p);
 
 int plot_add_lgroup(struct plot *p, struct lgroup *lg, void *lg_ops_arg)
 {
@@ -90,7 +95,7 @@ void plot_update_size(struct plot *p, bool init)
 				       p->bnd_prev_max.right;
 	}
 
-	getmaxyx(stdscr, p->height, p->width);
+	getmaxyx(p->win, p->height, p->width);
 
 	p->plotheight = p->height - p->bnd.bottom - p->bnd.top;
 	p->plotwidth = p->width - p->bnd.left - p->bnd.right;
@@ -234,7 +239,7 @@ static void __paint_line(struct plot *p, const struct lgroup *lg,
 		int w = p->plotwidth + p->bnd.left - (nvs - ivs);
 
 		attron(color);
-		ln->ops->horizon(p, h, w, 1);
+		ln->ops->horizon(p, p->win, h, w, 1);
 		attroff(color);
 
 		/**
@@ -245,13 +250,14 @@ static void __paint_line(struct plot *p, const struct lgroup *lg,
 		if (prev_h != -1) {
 			attron(color);
 			if (prev_h > h) {
-				ln->ops->lrcorner(p, prev_h, w);
-				ln->ops->ulcorner(p, h, w);
-				ln->ops->vertical(p, h + 1, w, prev_h - h - 1);
+				ln->ops->lrcorner(p, p->win, prev_h, w);
+				ln->ops->ulcorner(p, p->win, h, w);
+				ln->ops->vertical(p, p->win, h + 1, w,
+						  prev_h - h - 1);
 			} else if (h > prev_h) {
-				ln->ops->urcorner(p, prev_h, w);
-				ln->ops->llcorner(p, h, w);
-				ln->ops->vertical(p, prev_h + 1, w,
+				ln->ops->urcorner(p, p->win, prev_h, w);
+				ln->ops->llcorner(p, p->win, h, w);
+				ln->ops->vertical(p, p->win, prev_h + 1, w,
 						  h - prev_h - 1);
 			}
 			attroff(color);
@@ -349,11 +355,13 @@ static void __draw_axes(const struct plot *p)
 {
 	const struct ltype_ops *ops = ltype_type2ops(p->axis_curve_type);
 
-	ops->horizon(p, p->plotheight + p->bnd.top, p->bnd.left, p->plotwidth);
-	ops->vertical(p, p->bnd.top, p->bnd.left, p->plotheight);
-	ops->llcorner(p, p->plotheight + p->bnd.top, p->bnd.left);
-	ops->uarrow(p, p->bnd.top, p->bnd.left);
-	ops->rarrow(p, p->plotheight + p->bnd.top, p->plotwidth + p->bnd.left);
+	ops->horizon(p, p->win, p->plotheight + p->bnd.top, p->bnd.left,
+		     p->plotwidth);
+	ops->vertical(p, p->win, p->bnd.top, p->bnd.left, p->plotheight);
+	ops->llcorner(p, p->win, p->plotheight + p->bnd.top, p->bnd.left);
+	ops->uarrow(p, p->win, p->bnd.top, p->bnd.left);
+	ops->rarrow(p, p->win, p->plotheight + p->bnd.top,
+		    p->plotwidth + p->bnd.left);
 
 	/* x/y axis labels */
 	mvaddstr(p->bnd.top - 1, p->bnd.left, p->label_y);
@@ -443,7 +451,7 @@ void __plot_debug_llabel(const struct lgroup *lg, int height)
 }
 
 /**
- * need erase() before, refresh() after
+ * need call werase() before, and call doupdate() after
  */
 static void __paint_plot(struct plot *p, bool debug)
 {
@@ -509,6 +517,9 @@ static void __plot_redraw(struct plot *p, bool debug)
 	p->redrawcount++;
 
 	erase();
+	if (p->win_help) {
+		werase(p->win_help);
+	}
 
 	/**
 	 * Handle the keyboard first, because 'reset' need before paint.
@@ -518,13 +529,14 @@ static void __plot_redraw(struct plot *p, bool debug)
 	__paint_plot(p, debug);
 
 	if (p->expired_usec.help && p->expired_usec.help > usecs()) {
-		plot_help(p);
+		__paint_help_win(p, false);
 	} else {
 		p->expired_usec.help = 0;
+		__del_help_win(p);
 	}
 
 	if (p->expired_usec.llabel && p->expired_usec.llabel > usecs()) {
-		plot_llabel(p);
+		__paint_llabels(p);
 	} else {
 		p->expired_usec.llabel = 0;
 	}
@@ -533,13 +545,6 @@ static void __plot_redraw(struct plot *p, bool debug)
 		p->plotshift = 0;
 		p->expired_usec.shift = 0;
 	}
-
-	refresh();
-
-	plot_update_size(p, false);
-
-	/* do some reset */
-	p->kb->current_key = 0;
 }
 
 void plot_redraw(struct plot *p, bool debug)
@@ -550,6 +555,16 @@ void plot_redraw(struct plot *p, bool debug)
 		plot_update_size(p, false);
 		__plot_redraw(p, debug);
 	}
+
+	wnoutrefresh(p->win);
+	if (p->win_help) {
+		wnoutrefresh(p->win_help);
+	}
+	doupdate();
+
+	/* do some reset */
+	plot_update_size(p, false);
+	p->kb->current_key = 0;
 }
 
 static const char *key_helps[] = {
@@ -558,19 +573,54 @@ static const char *key_helps[] = {
 	KEY_HELP_LEFT, KEY_HELP_RIGHT, KEY_HELP_ENTER,
 };
 
-void plot_help(const struct plot *p)
+static int max_key_help_len(void)
 {
-	int h = p->plotheight + p->bnd.top - 1;
-	int w = p->bnd.left + 1;
-	int n = sizeof(key_helps) / sizeof(key_helps[0]);
+	static int max = 0;
+	if (max != 0)
+		return max;
 
-	attron(colors[C_BLUE] | A_BOLD);
-	for (int i = n - 1; i >= 0; i--)
-		mvprintw(h - i, w, "%s", key_helps[n - i - 1]);
-	attroff(colors[C_BLUE] | A_BOLD);
+	for (int i = 0; i < ARRAY_SIZE(key_helps); i++) {
+		int len = strlen(key_helps[i]);
+		if (len > max)
+			max = len;
+	}
+	return max;
 }
 
-void plot_llabel(const struct plot *p)
+static void __paint_help_win(struct plot *p, bool init)
+{
+	int h = p->plotheight / 2 + p->bnd.top - ARRAY_SIZE(key_helps) / 2;
+	int w = p->plotwidth / 2 + p->bnd.left - max_key_help_len() / 2;
+	int n = sizeof(key_helps) / sizeof(key_helps[0]);
+	WINDOW *win = p->win_help;
+
+	if (init && !win) {
+		win = newwin(n + 2, max_key_help_len() + 2, h, w);
+	}
+
+	wattron(win, colors[C_BLUE] | A_BOLD);
+	box(win, 0, 0);
+	mvwprintw(win, 0, 2, "[ HELP ]");
+	for (int i = n - 1; i >= 0; i--)
+		mvwprintw(win, i + 1, 1, "%s", key_helps[n - i - 1]);
+	wattroff(win, colors[C_BLUE] | A_BOLD);
+
+	if (init) {
+		p->panel_help = new_panel(win);
+		top_panel(p->panel_help);
+	}
+	update_panels();
+}
+
+static void __del_help_win(struct plot *p)
+{
+	delwin(p->win_help);
+	del_panel(p->panel_help);
+	p->win_help = NULL;
+	p->panel_help = NULL;
+}
+
+static void __paint_llabels(const struct plot *p)
 {
 	int i, nline = 0;
 
@@ -591,7 +641,7 @@ void plot_llabel(const struct plot *p)
 			const int n = 6;
 
 			attron(colors[ln->color] | A_BOLD);
-			ln->ops->horizon(p, hi, w, n);
+			ln->ops->horizon(p, p->win, hi, w, n);
 			mvprintw(hi, w + n + 1, " %s", ln->name);
 			attroff(colors[ln->color] | A_BOLD);
 			i++;
@@ -602,29 +652,29 @@ void plot_llabel(const struct plot *p)
 /**
  * Press key 'h', display the help info
  */
-static int key_h(int key, void *arg)
+static int key_h_handler(int key, void *arg)
 {
 	struct plot *p = arg;
 	p->expired_usec.help = usecs() + EXPIRED_USECS_HELP;
-	plot_help(p);
+	__paint_help_win(p, true);
 	return 0;
 }
 
 /**
  * Press key 'l', display the label for each line.
  */
-static int key_l(int key, void *arg)
+static int key_l_handler(int key, void *arg)
 {
 	struct plot *p = arg;
 	p->expired_usec.llabel = usecs() + EXPIRED_USECS_LLABEL;
-	plot_llabel(p);
+	__paint_llabels(p);
 	return 0;
 }
 
 /**
  * Press key 'r', reset plot
  */
-static int key_r(int key, void *arg)
+static int key_r_handler(int key, void *arg)
 {
 	struct plot *p = arg;
 
@@ -639,26 +689,26 @@ static int key_r(int key, void *arg)
 /**
  * Press key 't', change curve type
  */
-static int key_t(int key, void *arg)
+static int key_t_handler(int key, void *arg)
 {
 	struct plot *p = arg;
 	p->curve_type = (p->curve_type + 1) % CURVE_TYPE_MAX;
 	return 0;
 }
 
-static int key_up(int key, void *arg)
+static int key_up_handler(int key, void *arg)
 {
 	plot_scaling_up(arg);
 	return 0;
 }
 
-static int key_down(int key, void *arg)
+static int key_down_handler(int key, void *arg)
 {
 	plot_scaling_down(arg);
 	return 0;
 }
 
-static int key_left(int key, void *arg)
+static int key_left_handler(int key, void *arg)
 {
 	struct plot *p = arg;
 	/* 10 seconds */
@@ -667,7 +717,7 @@ static int key_left(int key, void *arg)
 	return 0;
 }
 
-static int key_right(int key, void *arg)
+static int key_right_handler(int key, void *arg)
 {
 	struct plot *p = arg;
 	/* 10 seconds */
@@ -694,14 +744,14 @@ int plot_init(struct plot *p, struct keyboard *kb, const char *file, bool debug,
 		return -EINVAL;
 	p->x_type = x_type;
 
-	err = err ?: register_key_handler(kb, 'r', p, key_r);
-	err = err ?: register_key_handler(kb, 't', p, key_t);
-	err = err ?: register_key_handler(kb, 'h', p, key_h);
-	err = err ?: register_key_handler(kb, 'l', p, key_l);
-	err = err ?: register_key_handler(kb, KEY_UP, p, key_up);
-	err = err ?: register_key_handler(kb, KEY_DOWN, p, key_down);
-	err = err ?: register_key_handler(kb, KEY_RIGHT, p, key_right);
-	err = err ?: register_key_handler(kb, KEY_LEFT, p, key_left);
+	err = err ?: register_key_handler(kb, 'r', p, key_r_handler);
+	err = err ?: register_key_handler(kb, 't', p, key_t_handler);
+	err = err ?: register_key_handler(kb, 'h', p, key_h_handler);
+	err = err ?: register_key_handler(kb, 'l', p, key_l_handler);
+	err = err ?: register_key_handler(kb, KEY_UP, p, key_up_handler);
+	err = err ?: register_key_handler(kb, KEY_DOWN, p, key_down_handler);
+	err = err ?: register_key_handler(kb, KEY_RIGHT, p, key_right_handler);
+	err = err ?: register_key_handler(kb, KEY_LEFT, p, key_left_handler);
 
 	if (file && !err)
 		err = err ?: load_plot(p, file, debug);
