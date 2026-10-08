@@ -17,4 +17,5 @@ do
 			print s" "c
 		}'
 	sleep 0.002
-done | ${PLOTCAKE} --title "Trigonometric Functions" -l "Sin" -l "Cos"
+done | ${PLOTCAKE} --title "Trigonometric Functions" -l "Sin" -l "Cos" \
+	-o trigonometric-functions --x-index "${@}"

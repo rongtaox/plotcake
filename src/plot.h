@@ -11,6 +11,7 @@
 #include "line.h"
 #include "utils.h"
 #include "dialog.h"
+#include "id-handler.h"
 
 /**
  * Scaling plotting values, different from @plotscaling.
@@ -28,6 +29,9 @@ struct plot {
 	char title[128];
 	char label_x[64];
 	char label_y[64];
+
+	bool debug;
+
 	/**
 	 * max indicates the maximum value your terminal has reached during the
 	 * entire program run (you can use the mouse to drag and adjust the
@@ -56,6 +60,8 @@ struct plot {
 	 * number of points will be scaled by @plotscaling.
 	 */
 	unsigned long plotshift;
+	int plotshift_timerfd;
+
 	struct {
 		int top, bottom, left, right;
 	} bnd, bnd_prev_max;
@@ -78,17 +84,41 @@ struct plot {
 	enum ltype_enum axis_curve_type;
 	enum x_axis_type x_type;
 
+#ifdef DEBUG
+#define PLOT_DEBUG0_DIALOG_FMT ", dialog:%d:%d:%d:%d"
+#define PLOT_DEBUG0_DIALOG_ARG                                             \
+	, id_handle_count(p->dialog_to_start_time),                        \
+		id_handle_count(p->start_time_to_dialog), p->help_timerfd, \
+		p->llabels_timerfd
+#else
+#define PLOT_DEBUG0_DIALOG_FMT
+#define PLOT_DEBUG0_DIALOG_ARG
+#endif
+
 #define PLOT_INF0_FMT                                                      \
 	"plot(redraw=%ld, %.3f MiB, win[%d,%d], max[%d,%d], plot[%d,%d], " \
-	"scale %d, shft %ld/%ld, %s:%d)"
+	"scale %d, shft %ld/%ld, %s:%d" PLOT_DEBUG0_DIALOG_FMT ")"
 #define PLOT_INF0_ARG(p)                                                   \
 	p->redrawcount, plot_mem_size(p) * 1. / 1024 / 1024, p->height,    \
 		p->width, p->heightmax, p->widthmax, p->plotheight,        \
 		p->plotwidth, p->plotscaling, p->plotshift, plot_shift(p), \
-		x_axis_type_str(p->x_type), p->x_type
+		x_axis_type_str(p->x_type), p->x_type PLOT_DEBUG0_DIALOG_ARG
 
 	WINDOW *win; /* equal to stdscr */
+
 	struct dialog help, llabels;
+	int help_timerfd, llabels_timerfd;
+
+	/**
+	 * We can use the dialog object to retrieve the timestamp of its last
+	 * display and locate specific dialogs based on that time. By sorting
+	 * based on time, we can control the rendering order (z-axis-order) of
+	 * the dialogs.
+	 */
+	id_handle_t dialog_to_start_time;
+	id_handle_t start_time_to_dialog;
+
+	enum win_border_type win_border_type;
 };
 
 #define for_each_lgroup(plt, iter)                                       \
@@ -158,7 +188,8 @@ static inline void set_plot_ylabel(struct plot *p, const char *label)
 }
 
 int plot_init(struct plot *p, struct keyboard *kb, const char *file, bool debug,
-	      enum x_axis_type x_type, enum ltype_enum axis);
+	      enum x_axis_type x_type, enum ltype_enum axis,
+	      enum win_border_type win_border);
 int plot_destroy(struct plot *p);
 unsigned long plot_mem_size(const struct plot *p);
 
@@ -172,7 +203,7 @@ void plot_update_size(struct plot *p, bool init);
 
 int plot_create_lines(struct plot *p);
 void plot_update_data(struct plot *p);
-void plot_redraw(struct plot *p, bool debug);
+void plot_redraw(struct plot *p);
 
 void init_flavor(void);
 chtype getflavor(enum lcolor_enum color);

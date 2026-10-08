@@ -16,6 +16,13 @@ unsigned long usecs(void)
 	return tv.tv_sec * 1000000UL + tv.tv_usec;
 }
 
+unsigned long nsecs(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return ts.tv_sec * 1000000000UL + ts.tv_nsec;
+}
+
 const char *timeval_str(struct timeval *tv, char buf[32])
 {
 	strftime(buf, 32, "%T", localtime(&tv->tv_sec));
@@ -118,22 +125,23 @@ long alloc_buf_read_file(const char *filename, char **buf)
 
 /**
  * @nsecs: timeout nanoseconds
+ * @return: timerfd, close with close(2).
  */
 int new_timerfd(unsigned long nsecs)
 {
-	int timerfd;
+	int fd;
 	unsigned long secs;
 
 	/* default 1s */
 	if (nsecs == 0)
 		nsecs = 1000000000UL;
 
-	timerfd = timerfd_create(CLOCK_REALTIME, TFD_CLOEXEC);
+	fd = timerfd_create(CLOCK_REALTIME, TFD_CLOEXEC);
 
 	secs = nsecs / 1000000000UL;
 	nsecs -= secs * 1000000000UL;
 
 	struct itimerspec to = { { secs, nsecs }, { secs, nsecs } };
-	timerfd_settime(timerfd, 0, &to, NULL);
-	return timerfd;
+	timerfd_settime(fd, 0, &to, NULL);
+	return fd;
 }

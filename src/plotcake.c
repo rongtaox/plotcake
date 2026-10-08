@@ -40,7 +40,7 @@
 #include "stdin.h"
 #include "axis.h"
 #include "utils.h"
-#include "fd-handler.h"
+#include "id-handler.h"
 #include "plotcake.h"
 
 enum {
@@ -52,6 +52,7 @@ enum {
 	ARG_LINE_COLORS,
 	ARG_X_AXIS_INDEX,
 	ARG_AXIS_CURVE_TYPE,
+	ARG_WIN_BORDER_TYPE,
 };
 
 const char argp_prog_doc[] = ANSI_BOLD
@@ -141,6 +142,9 @@ static const struct argp_option opts[] = {
 	{ "axis-curve-type", ARG_AXIS_CURVE_TYPE, "TYPE", 0,
 	  "Plotting line types for coordinate axes, the supported types will "
 	  "be listed or use --ltypes show all types supported " },
+	{ "win-border", ARG_WIN_BORDER_TYPE, "[utf8]", 0,
+	  "Sets the border type for the pop-up window; currently, only 'utf8'"
+	  " and 'auto' are supported." },
 	{ "verbose", 'v', NULL, 1,
 	  "Display detail (shortcut: " KEY_HELP_v ")" },
 	{ "version", 'V', NULL, 1, "Display version" },
@@ -161,6 +165,7 @@ static char *ylabel = NULL;
 static enum curve_type curve_type = CURVE_TYPE_NONE;
 static enum x_axis_type x_type = X_TIMEVAL;
 static enum ltype_enum axis_curve_type = LINE_TYPE_THIN_UNICODE;
+static enum win_border_type win_border_type = WIN_BORDER_TYPE_DEFAULT;
 
 static struct plot plot = { 0 };
 static struct keyboard keyboard = { 0 };
@@ -205,6 +210,16 @@ static error_t parse_arg(int opt, char *arg, struct argp_state *state)
 		if (!ltype_hasname(arg))
 			err = -EINVAL;
 		axis_curve_type = ltype_name2type(arg);
+		break;
+	case ARG_WIN_BORDER_TYPE:
+		if (!strcmp(arg, "utf8")) {
+			win_border_type = WIN_BORDER_TYPE_UTF8;
+		} else {
+			fprintf(stderr,
+				"--win-border not support '%s', see --help\n",
+				arg);
+			exit(EXIT_FAILURE);
+		}
 		break;
 	case 'C':
 		if (!lcolor_hasname(arg))
@@ -306,7 +321,7 @@ static int update_data_and_check_interval(struct plot *p)
 	return 1;
 }
 
-int epoll_add_fd(int fd)
+int plotcake_poll_add_fd(int fd)
 {
 	struct epoll_event event;
 	event.data.fd = fd;
@@ -314,20 +329,20 @@ int epoll_add_fd(int fd)
 	return epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
 }
 
-int epoll_del_fd(int fd)
+int plotcake_poll_del_fd(int fd)
 {
 	return epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, NULL);
 }
 
-struct redraw_arg {
-	bool *redraw;
+struct loop_arg {
+	bool redraw;
 	bool should_end;
 	struct plot *plot;
 };
 
-static int tmout_handler(int fd, void *arg)
+static int tmout_handler(long fd, void *arg)
 {
-	struct redraw_arg *a = arg;
+	struct loop_arg *a = arg;
 	uint64_t exp;
 	read(fd, &exp, sizeof(exp));
 	broadcast_sig(SIGINT);
@@ -335,21 +350,21 @@ static int tmout_handler(int fd, void *arg)
 	return 0;
 }
 
-static int fresher_handler(int fd, void *arg)
+static int fresher_handler(long fd, void *arg)
 {
-	struct redraw_arg *a = arg;
+	struct loop_arg *a = arg;
 	uint64_t exp;
 	read(fd, &exp, sizeof(exp));
-	*a->redraw = true;
+	a->redraw = true;
 	update_data_and_check_interval(a->plot);
 	return 0;
 }
 
-static int key_handler(int fd, void *arg)
+static int key_handler(long fd, void *arg)
 {
 	int count = 0;
-	struct redraw_arg *a = arg;
-	bool redraw = false;
+	struct loop_arg *a = arg;
+	a->redraw = false;
 	struct plot *plot = a->plot;
 
 	/**
@@ -399,19 +414,19 @@ static int key_handler(int fd, void *arg)
 		switch (plot->kb->current_key) {
 		case KEY_LEFT:
 			plot->kb->cnt.left++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		case KEY_RIGHT:
 			plot->kb->cnt.right++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		case KEY_UP:
 			plot->kb->cnt.up++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		case KEY_DOWN:
 			plot->kb->cnt.down++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		case 'q': /* quit */
 			broadcast_sig(SIGINT);
@@ -419,25 +434,26 @@ static int key_handler(int fd, void *arg)
 			break;
 		case 'v': /* verbose mode switch */
 			plot->kb->cnt.v++;
-			redraw = true;
 			verbose = !verbose;
+			plot->debug = verbose;
+			a->redraw = true;
 			break;
 		case 'r': /* reset plot */
 			plot->kb->cnt.r++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		/* select numerical scaling type */
 		case 't':
 			plot->kb->cnt.t++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		case 'h': /* help */
 			plot->kb->cnt.h++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		case 'l': /* list line labels */
 			plot->kb->cnt.l++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		/**
 		 * Sometimes, the arrow keys can accidentally trigger Esc,
@@ -447,20 +463,20 @@ static int key_handler(int fd, void *arg)
 		case 27: /* Esc, 0x1B, 033, ^[ */
 		case 13: /* enter */
 			plot->kb->cnt.enter++;
-			redraw = true;
+			a->redraw = true;
 			break;
 		}
 	}
-	*a->redraw = redraw;
 	return 0;
 }
 
-static int sig_rd_handler(int fd, void *arg)
+static int sig_rd_handler(long fd, void *arg)
 {
 	unsigned char signo;
-	struct redraw_arg *a = arg;
-	bool redraw = false;
+	struct loop_arg *a = arg;
 	struct plot *plot = a->plot;
+
+	a->redraw = false;
 
 	const ssize_t cnt = read(fd, &signo, 1);
 	if (cnt > 0) {
@@ -472,26 +488,25 @@ static int sig_rd_handler(int fd, void *arg)
 			werase(plot->win);
 			wrefresh(plot->win);
 			plot_update_size(plot, false);
-			redraw = true;
+			a->redraw = true;
 		}
 	}
-	*a->redraw = redraw;
 	return 0;
 }
 
-static int stdinfd_handler(int fd, void *arg)
+static int stdinfd_handler(long fd, void *arg)
 {
-	struct redraw_arg *a = arg;
-	bool redraw = false;
+	struct loop_arg *a = arg;
 	struct plot *plot = a->plot;
+
+	a->redraw = false;
 
 	memset(stdin_buffer, 0, sizeof(stdin_buffer));
 	ssize_t cnt = read(fd, stdin_buffer, sizeof(stdin_buffer));
 	if (cnt > 0) {
-		redraw = true;
+		a->redraw = true;
 	}
 	update_data_and_check_interval(plot);
-	*a->redraw = redraw;
 	return 0;
 }
 
@@ -500,8 +515,7 @@ int main(int argc, char *argv[])
 	int err = 0;
 	int freshtimerfd, keyfd, stdinfd, tmout_exit_fd;
 	int sigpipe[2];
-	bool redraw = false;
-	struct redraw_arg redraw_arg;
+	struct loop_arg loop_arg;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err) {
@@ -514,7 +528,7 @@ int main(int argc, char *argv[])
 
 	keyboard_init(&keyboard);
 	err = plot_init(&plot, &keyboard, file, verbose, x_type,
-			axis_curve_type);
+			axis_curve_type, win_border_type);
 	if (err) {
 		fprintf(stderr, "plot init failed, %s\n", strerror(-err));
 		return err;
@@ -535,9 +549,9 @@ int main(int argc, char *argv[])
 
 	tmout_exit_fd = freshtimerfd = keyfd = stdinfd = -1;
 
-	redraw_arg.redraw = &redraw;
-	redraw_arg.should_end = false;
-	redraw_arg.plot = &plot;
+	loop_arg.redraw = false;
+	loop_arg.should_end = false;
+	loop_arg.plot = &plot;
 
 	/**
 	 * If stdin is redirected, open the terminal for key press.
@@ -570,12 +584,12 @@ int main(int argc, char *argv[])
 	} else
 		keyfd = STDIN_FILENO;
 
-	epoll_add_fd(keyfd);
-	register_fd(keyfd, key_handler, &redraw_arg);
+	plotcake_poll_add_fd(keyfd);
+	register_id(NULL, keyfd, key_handler, &loop_arg);
 
 	if (stdinfd != -1) {
-		epoll_add_fd(stdinfd);
-		register_fd(stdinfd, stdinfd_handler, &redraw_arg);
+		plotcake_poll_add_fd(stdinfd);
+		register_id(NULL, stdinfd, stdinfd_handler, &loop_arg);
 	} else {
 		/**
 		 * Note: When we read data from stdin, we no longer need this
@@ -585,18 +599,18 @@ int main(int argc, char *argv[])
 		 * continue for stdin if plot/line information matched.
 		 */
 		freshtimerfd = new_timerfd(interval_nsecs);
-		epoll_add_fd(freshtimerfd);
-		register_fd(freshtimerfd, fresher_handler, &redraw_arg);
+		plotcake_poll_add_fd(freshtimerfd);
+		register_id(NULL, freshtimerfd, fresher_handler, &loop_arg);
 	}
 
 	if (tmout_nsecs != 0) {
 		tmout_exit_fd = new_timerfd(tmout_nsecs);
-		epoll_add_fd(tmout_exit_fd);
-		register_fd(tmout_exit_fd, tmout_handler, &redraw_arg);
+		plotcake_poll_add_fd(tmout_exit_fd);
+		register_id(NULL, tmout_exit_fd, tmout_handler, &loop_arg);
 	}
 
-	epoll_add_fd(sig_rd_fd);
-	register_fd(sig_rd_fd, sig_rd_handler, &redraw_arg);
+	plotcake_poll_add_fd(sig_rd_fd);
+	register_id(NULL, sig_rd_fd, sig_rd_handler, &loop_arg);
 
 	/* curses start from here */
 
@@ -644,21 +658,22 @@ int main(int argc, char *argv[])
 		plot_update_data(&plot);
 	}
 	plot_update_size(&plot, true);
-	plot_redraw(&plot, verbose);
+	plot_redraw(&plot);
 
 	/* main loop */
 	struct epoll_event epollevents[16];
 	while (1) {
+		loop_arg.redraw = false;
 		int nfds = epoll_wait(epollfd, epollevents, 16, -1);
 		for (int i = 0; i < nfds; i++) {
 			int cur_fd = epollevents[i].data.fd;
-			if (handle_fd(cur_fd) == -ENOENT)
+			if (handle_id(NULL, cur_fd) == -ENOENT)
 				continue;
-			if (redraw_arg.should_end)
+			if (loop_arg.should_end)
 				goto end;
 
-			if (redraw) {
-				plot_redraw(&plot, verbose);
+			if (loop_arg.redraw) {
+				plot_redraw(&plot);
 			}
 		}
 	}
@@ -685,9 +700,10 @@ end:
 		fprintf(stderr, KEYBOARD_INF0_FMT "\n",
 			KEYBOARD_INF0_ARG(_p->kb));
 	}
-	save_plot(&plot, output_file_prefix, verbose);
+	save_plot(&plot, output_file_prefix);
 	if (output_file_prefix)
 		free(output_file_prefix);
 	plot_destroy(&plot);
+	release_id_handle(NULL);
 	return 0;
 }
